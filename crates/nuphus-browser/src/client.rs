@@ -6,6 +6,9 @@
 //! - Login state persistence (--user-data-dir)
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::target::{
+    CreateTargetParams, GetTargetsParams, TargetId,
+};
 use chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId;
 use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::page::ScreenshotParams;
@@ -530,6 +533,10 @@ pub struct BrowserClient {
     browser: Option<Arc<tokio::sync::Mutex<Browser>>>,
     /// Current page
     page: Option<Arc<tokio::sync::Mutex<Page>>>,
+    /** Stable task target retained across CDP reconnections, independent of UI focus. */
+    selected_target_id: Option<TargetId>,
+    /** An interrupted create request must be resolved explicitly before creating again. */
+    page_creation_pending: bool,
     /// Cached snapshot refs from the last AX tree snapshot (`@1` → index 0, …).
     /// Each entry carries the owning frame so nested-frame refs stay resolvable
     /// and failures can name the frame.
@@ -1123,6 +1130,8 @@ impl BrowserClient {
             profile_dir,
             browser: None,
             page: None,
+            selected_target_id: None,
+            page_creation_pending: false,
             snapshot_refs: Vec::new(),
             helpers_injected: false,
             download_dir,
@@ -1145,6 +1154,8 @@ impl BrowserClient {
             profile_dir,
             browser: None,
             page: None,
+            selected_target_id: None,
+            page_creation_pending: false,
             snapshot_refs: Vec::new(),
             helpers_injected: false,
             download_dir,
@@ -1425,8 +1436,10 @@ impl BrowserClient {
         spawn_cdp_handler(handler);
 
         self.child_process = Some(child);
-        self.browser = Some(Arc::new(Mutex::new(browser)));
+        let browser_arc = Arc::new(Mutex::new(browser));
+        self.browser = Some(browser_arc.clone());
         self.launched_headless = Some(headless);
+        self.adopt_existing_page(&browser_arc).await?;
         Ok(())
     }
 
@@ -1497,6 +1510,7 @@ impl BrowserClient {
         );
         let browser_arc = Arc::new(Mutex::new(browser));
         self.browser = Some(browser_arc.clone());
+        self.page = None;
         self.child_process = None; // attached instance does not belong to this process; close must not kill it
         self.launched_headless = None; // mode unknown; do not trigger a headless→headed upgrade restart
 
@@ -1523,10 +1537,7 @@ impl BrowserClient {
             }
         }
 
-        // A3: adopt the first existing page as the current tab (refreshing a leftover /
-        // orphan instance's page) so this session reuses the old tab instead of letting
-        // navigate's new_page fallback accumulate fresh tabs on every reattach.
-        self.adopt_existing_page(&browser_arc, true).await;
+        self.adopt_existing_page(&browser_arc).await?;
 
         Ok(())
     }
@@ -1660,6 +1671,7 @@ impl BrowserClient {
         tracing::info!("[Browser] attached to external browser ({})", base);
         let browser_arc = Arc::new(Mutex::new(browser));
         self.browser = Some(browser_arc.clone());
+        self.page = None;
         self.child_process = None; // external instance belongs to the user; close must not kill it
         self.launched_headless = None; // mode unknown; no headless→headed upgrade restart
 
@@ -1683,9 +1695,7 @@ impl BrowserClient {
             }
         }
 
-        // A3: adopt the first existing page as the current tab. External/user browser:
-        // adopt without reloading so the user's current page is never disturbed.
-        self.adopt_existing_page(&browser_arc, false).await;
+        self.adopt_existing_page(&browser_arc).await?;
 
         Ok(())
     }
@@ -2559,7 +2569,7 @@ impl BrowserClient {
              was dispatched but nothing changed. Either the key is inert on this page, or the \
              tab is not the focused/visible one (CDP input is dropped while \
              `document.hasFocus()` is false). Confirm with browser_snapshot, and use \
-             browser_switch_tab / browser_new_tab to bring the target tab to the front."
+             browser_switch_tab with activate=true only if foreground interaction is needed."
         ))
     }
 
@@ -3687,6 +3697,8 @@ impl BrowserClient {
         }
         self.page = None;
         self.launched_headless = None;
+        self.selected_target_id = None;
+        self.page_creation_pending = false;
         // Session state must not leak into the next launch: @N refs die with the
         // page, and download behavior has to be re-configured on the new browser.
         self.snapshot_refs.clear();
@@ -3729,9 +3741,7 @@ impl BrowserClient {
         if self.external_cdp_url == normalized && self.external_identity == identity {
             return Ok(());
         }
-        if self.browser.is_some() {
-            self.close().await?;
-        }
+        self.close().await?;
         self.external_cdp_url = normalized;
         self.external_identity = identity;
         Ok(())
@@ -3753,32 +3763,45 @@ impl BrowserClient {
             match child.try_wait() {
                 Ok(Some(_status)) => false, // exited
                 Ok(None) => true,           // still running
-                Err(_) => false,            // status unknown → treat as gone
+                Err(_) => true,
             }
         })
     }
 
-    /// Reconnect after a confirmed dead CDP connection: reset local state, relaunch a fresh
-    /// browser (same window mode), and restore a usable `about:blank` page so the next
-    /// operation does not fail with `NoPage`. Callers (tool executors) should probe liveness
-    /// first and only invoke this when the connection is genuinely dead — a slow page with a
-    /// healthy connection must NOT be torn down.
+    /**
+     * Reconnects to the same browser and task target before considering a launch.
+     * A live managed process is never killed because its CDP connection failed.
+     * Closed targets receive at most one background replacement; writes are not replayed.
+     */
     pub async fn reconnect(&mut self) -> Result<(), BrowserError> {
         let headless_mode = self.launched_headless.unwrap_or(false);
         self.browser = None;
         self.page = None;
-        self.launched_headless = None;
         self.snapshot_refs.clear();
         self.helpers_injected = false;
         self.download_configured = false;
         self.download_config_warning = None;
-        if let Some(mut child) = self.child_process.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+
+        if self.external_cdp_url.is_none()
+            && (self.child_process_alive() == Some(true) || self.attach_target_alive().await)
+        {
+            let child = self.child_process.take();
+            let mode = self.launched_headless;
+            let result = self.try_attach().await;
+            self.child_process = child;
+            self.launched_headless = mode;
+            result?;
+        } else {
+            if let Some(mut child) = self.child_process.take() {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(CLOSE_TIMEOUT_SECS),
+                    child.wait(),
+                )
+                .await;
+            }
+            self.launched_headless = None;
+            self.launch(headless_mode).await?;
         }
-        self.launch(headless_mode).await?;
-        // Restore a usable page so page-dependent operations don't hit NoPage after the reset
-        // (the caller's retried operation then targets a blank page; a navigate re-targets it).
         self.get_or_create_page().await?;
         Ok(())
     }
@@ -3804,35 +3827,45 @@ impl BrowserClient {
         }
     }
 
-    /// New tab
+    /** Opens an explicitly requested tab without activating the browser. */
     pub async fn new_tab(&mut self, url: Option<&str>) -> Result<String, BrowserError> {
-        let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
+        self.new_tab_with_options(url, false).await
+    }
 
+    /** Opens and selects a task tab; foreground activation is opt-in. */
+    pub async fn new_tab_with_options(
+        &mut self,
+        url: Option<&str>,
+        activate: bool,
+    ) -> Result<String, BrowserError> {
+        self.ensure_no_pending_page_creation()?;
+        let browser = self
+            .browser
+            .as_ref()
+            .ok_or(BrowserError::NotStarted)?
+            .clone();
         let browser_guard = browser.lock().await;
-        // Bounded: a wedged connection (renderer replaced mid-navigation, browser
-        // going away) must fail fast with a readable error.
-        let page = tokio::time::timeout(
+        self.page_creation_pending = true;
+        let target = tokio::time::timeout(
             std::time::Duration::from_secs(NEW_PAGE_TIMEOUT_SECS),
-            browser_guard.new_page(url.unwrap_or("about:blank")),
+            browser_guard.execute(CreateTargetParams {
+                background: Some(!activate),
+                ..CreateTargetParams::new(url.unwrap_or("about:blank"))
+            }),
         )
         .await
-        .map_err(|_| {
-            BrowserError::Launch(format!(
-                "Timed out after {NEW_PAGE_TIMEOUT_SECS}s opening a new tab (CDP unresponsive)"
-            ))
-        })?
-        .map_err(|e| BrowserError::Launch(e.to_string()))?;
-
-        let page_arc = Arc::new(Mutex::new(page));
-        self.page = Some(page_arc);
-        // New page, new backendNodeId space — stale @N refs must not carry over.
-        self.snapshot_refs.clear();
-
-        // Enable DOM domain for the new tab and register the anti-detection script.
-        {
-            let page_guard = self.page.as_ref().unwrap().lock().await;
-            let _ = cdp(page_guard.execute(DOMEnable::default())).await;
-            let _ = Self::inject_anti_detection(&page_guard).await;
+        .map_err(|_| BrowserError::Execution(
+            "New-tab request timed out; it may already have opened. Use browser_list_tabs and browser_switch_tab before trying to create another tab.".into()
+        ))?
+        .map_err(cdp_err)?;
+        self.selected_target_id = Some(target.result.target_id);
+        self.page = None;
+        self.page_creation_pending = false;
+        drop(browser_guard);
+        if !self.adopt_existing_page(&browser).await? {
+            return Err(BrowserError::Execution(
+                "The newly opened tab was closed before it could be selected.".into(),
+            ));
         }
 
         let url_str = url.unwrap_or("about:blank");
@@ -3846,29 +3879,44 @@ impl BrowserClient {
         let browser_guard = browser.lock().await;
         let pages = cdp(browser_guard.pages()).await?;
 
+        let targets = cdp(browser_guard.execute(GetTargetsParams::default()))
+            .await?
+            .result
+            .target_infos;
         let mut tabs = Vec::new();
         for (i, page) in pages.iter().enumerate() {
-            let url = cdp(page.url())
-                .await
-                .unwrap_or_default()
-                .unwrap_or_else(|| "about:blank".to_string());
-            let title = cdp(page.get_title())
-                .await
-                .unwrap_or_default()
-                .unwrap_or_else(|| "Untitled".to_string());
+            let Some(info) = targets
+                .iter()
+                .find(|target| &target.target_id == page.target_id())
+            else {
+                continue;
+            };
+            let url = &info.url;
+            let title = &info.title;
 
             tabs.push(serde_json::json!({
                 "index": i,
                 "url": url,
                 "title": title,
+                "target_id": page.target_id(),
+                "selected": self.selected_target_id.as_ref() == Some(page.target_id()),
             }));
         }
 
         Ok(tabs)
     }
 
-    /// Switch to tab (by index)
+    /** Selects the automation target without changing the user's foreground tab. */
     pub async fn switch_tab(&mut self, index: usize) -> Result<String, BrowserError> {
+        self.switch_tab_with_options(index, false).await
+    }
+
+    /** Selects a tab by index, activating it only when explicitly requested. */
+    pub async fn switch_tab_with_options(
+        &mut self,
+        index: usize,
+        activate: bool,
+    ) -> Result<String, BrowserError> {
         let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
 
         let browser_guard = browser.lock().await;
@@ -3886,17 +3934,19 @@ impl BrowserClient {
             .get(index)
             .ok_or_else(|| BrowserError::Execution("Invalid tab index".to_string()))?;
 
-        cdp_ctx("bring selected tab to front failed", page.bring_to_front()).await?;
-
-        let page_arc = Arc::new(Mutex::new(page.clone()));
-        self.page = Some(page_arc);
-        // Different tab, different backendNodeId space — stale @N refs must not carry over.
-        self.snapshot_refs.clear();
+        if activate {
+            cdp_ctx("bring selected tab to front failed", page.bring_to_front()).await?;
+        }
 
         let url = cdp(page.url())
             .await
             .unwrap_or_default()
             .unwrap_or_else(|| "about:blank".to_string());
+
+        let page = page.clone();
+        drop(browser_guard);
+        self.page_creation_pending = false;
+        self.select_page(page).await;
 
         Ok(format!("Switched to tab {}: {}", index, url))
     }
@@ -3943,156 +3993,116 @@ impl BrowserClient {
         Ok(())
     }
 
-    /// After attaching to a running Chrome, wait for its existing targets to become
-    /// page-attachable and adopt the first existing page as the current page.
-    ///
-    /// chromiumoxide's attach is asynchronous: `fetch_targets()` returns before the
-    /// `AttachToTarget` responses land, and `pages()` only yields pages whose target
-    /// `session_id` has been set — so right after attach `pages()` can be empty and
-    /// `self.page` stays `None`. `navigate` then falls back to `new_page("about:blank")`,
-    /// accumulating a fresh tab every time a later session reuses the same Chrome
-    /// (the tab leak observed on orphan reattach).
-    ///
-    /// Polling until the first page is attachable and adopting it fixes both:
-    ///  - `self.page` is initialized from the existing tab, so snapshot/click/type work
-    ///    immediately and `navigate` reuses the same tab instead of opening a new one;
-    ///  - `list_tabs`/`switch_tab` see the pre-existing tabs.
-    ///
-    /// `reload` refreshes the adopted page — used for a leftover/orphan instance (this
-    /// process's own profile). The refresh is a raw `Page.reload` command plus a bounded
-    /// wait for `readyState` to leave "loading": chromiumoxide's `Page::reload()` additionally
-    /// waits for the `load` event, which a page with blocked subresources would hang on.
-    /// An external/user browser is adopted without reloading, so the user's current page
-    /// is never disturbed. Best-effort: any failure here degrades to the previous behavior
-    /// (new tab on navigate) and must not fail the attach itself.
-    async fn adopt_existing_page(&mut self, browser_arc: &Arc<Mutex<Browser>>, reload: bool) {
-        // Attach sessions land asynchronously; poll until a page is attachable.
+    /**
+     * Resolves the task's target without using the visible tab as a fallback.
+     * A successful target enumeration is required before concluding that a page
+     * is closed. Attachment delays and transport errors must never create tabs.
+     */
+    async fn existing_task_page(
+        &self,
+        browser_arc: &Arc<Mutex<Browser>>,
+    ) -> Result<Option<Page>, BrowserError> {
+        let browser = browser_arc.lock().await;
+        let targets = cdp(browser.execute(GetTargetsParams::default()))
+            .await?
+            .result
+            .target_infos;
+        let pages = targets
+            .iter()
+            .filter(|target| target.r#type == "page" && target.subtype.is_none())
+            .collect::<Vec<_>>();
+        let target = if let Some(id) = &self.selected_target_id {
+            pages.iter().find(|target| &target.target_id == id).copied()
+        } else {
+            pages
+                .iter()
+                .find(|target| !is_internal_chrome_url(&target.url))
+                .copied()
+                .or_else(|| pages.first().copied())
+        };
+        let Some(target) = target else {
+            return Ok(None);
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        let first_page = loop {
-            let pages = cdp(browser_arc.lock().await.pages())
-                .await
-                .unwrap_or_default();
-            if !pages.is_empty() {
-                // Prefer a real content page: Chrome's startup tab (`about:blank` /
-                // `chrome://new-tab-page`) lists first and would snapshot empty, so skip
-                // internal pages and adopt the first actual document. Fall back to the
-                // first page if every tab is an internal page.
-                let mut content_page = None;
-                for p in &pages {
-                    let u = cdp(p.url()).await.ok().flatten().unwrap_or_default();
-                    if !is_internal_chrome_url(&u) {
-                        content_page = Some(p.clone());
-                        break;
-                    }
+        loop {
+            match cdp(browser.get_page(target.target_id.clone())).await {
+                Ok(page) => return Ok(Some(page)),
+                Err(BrowserError::Connection(message)) => return Err(BrowserError::Connection(message)),
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                break Some(content_page.unwrap_or_else(|| pages[0].clone()));
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
-        let Some(page) = first_page else {
-            tracing::debug!("[Browser] no existing page to adopt after attach");
-            return;
-        };
-
-        let page_arc = Arc::new(Mutex::new(page));
-        self.page = Some(page_arc.clone()); // configure_download_dir below needs it set
-
-        if reload {
-            use chromiumoxide::cdp::browser_protocol::page::ReloadParams;
-            let guard = page_arc.lock().await;
-            if let Err(e) = cdp(guard.execute(ReloadParams::default())).await {
-                tracing::warn!("[Browser] reload of adopted page failed (leaving as-is): {e}");
-            }
-            drop(guard);
-            // Bounded wait for the reload to leave "loading" (the DOM is usable at
-            // "interactive"; a blocked-subresource page may never reach "complete").
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let ready = cdp(page_arc.lock().await.evaluate("document.readyState"))
-                    .await
-                    .ok()
-                    .and_then(|res| res.into_value::<serde_json::Value>().ok())
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                if !ready.is_empty() && ready != "loading" {
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        "[Browser] adopted page still loading after reload; continuing anyway"
-                    );
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Err(error) => return Err(BrowserError::Execution(format!(
+                    "The selected browser tab still exists but is not ready ({error}); retry later. No new tab was opened."
+                ))),
             }
         }
+    }
 
-        // Same setup as a freshly created page (see get_or_create_page): DOM domain +
-        // anti-detection script (covers snapshot DOM ops and bot-detection).
-        {
+    /** Adopts an existing target without reloading it or bringing it to the front. */
+    async fn adopt_existing_page(
+        &mut self,
+        browser_arc: &Arc<Mutex<Browser>>,
+    ) -> Result<bool, BrowserError> {
+        let Some(page) = self.existing_task_page(browser_arc).await? else {
+            return Ok(false);
+        };
+        self.select_page(page).await;
+        Ok(true)
+    }
+
+    /** Initializes page-local state only when adopting a new page or connection. */
+    async fn select_page(&mut self, page: Page) {
+        let needs_setup =
+            self.page.is_none() || self.selected_target_id.as_ref() != Some(page.target_id());
+        self.selected_target_id = Some(page.target_id().clone());
+        let page_arc = Arc::new(Mutex::new(page));
+        self.page = Some(page_arc.clone());
+        if needs_setup {
+            self.snapshot_refs.clear();
+            self.helpers_injected = false;
             let guard = page_arc.lock().await;
             let _ = cdp(guard.execute(DOMEnable::default())).await;
             let _ = Self::inject_anti_detection(&guard).await;
         }
-
-        // Download dir config on first page (same as get_or_create_page).
         if !self.download_configured {
-            if let Err(e) = self.configure_download_dir().await {
-                tracing::warn!("[Browser] download dir config failed on adopted page: {e}");
+            if let Err(error) = self.configure_download_dir().await {
+                tracing::warn!("[Browser] download dir config failed on selected page: {error}");
             }
         }
-
-        // Different page, different backendNodeId space — stale @N refs must not carry over.
-        self.snapshot_refs.clear();
-        tracing::info!("[Browser] adopted existing page as current tab");
     }
 
+    /** Refuses blind retries when a create request may have already reached Chrome. */
+    fn ensure_no_pending_page_creation(&self) -> Result<(), BrowserError> {
+        if self.page_creation_pending {
+            return Err(BrowserError::Execution(
+                "A previous new-tab request has an unknown outcome. Use browser_list_tabs and browser_switch_tab to select the intended tab; no additional tab was opened.".into()
+            ));
+        }
+        Ok(())
+    }
+
+    /** Reuses the task page; creates a background replacement only after confirming absence. */
     async fn get_or_create_page(&mut self) -> Result<Arc<Mutex<Page>>, BrowserError> {
-        if let Some(page) = &self.page {
-            return Ok(page.clone());
+        self.ensure_no_pending_page_creation()?;
+        let browser = self
+            .browser
+            .as_ref()
+            .ok_or(BrowserError::NotStarted)?
+            .clone();
+        if self.adopt_existing_page(&browser).await? {
+            return self.page.clone().ok_or(BrowserError::NoPage);
         }
-
-        let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
-
-        let browser_guard = browser.lock().await;
-        // Bounded: same rationale as `new_tab` — fail fast, readable error.
-        let page = tokio::time::timeout(
-            std::time::Duration::from_secs(NEW_PAGE_TIMEOUT_SECS),
-            browser_guard.new_page("about:blank"),
-        )
-        .await
-        .map_err(|_| {
-            BrowserError::Launch(format!(
-                "Timed out after {NEW_PAGE_TIMEOUT_SECS}s creating a browser page (CDP unresponsive)"
-            ))
-        })?
-        .map_err(|e| BrowserError::Launch(e.to_string()))?;
-
-        let page_arc = Arc::new(Mutex::new(page));
-        self.page = Some(page_arc.clone());
-
-        // Enable DOM domain (required for DOM.querySelector / resolveNode / describeNode)
-        // and register the anti-detection script (covers every page this instance creates).
-        {
-            let page_guard = page_arc.lock().await;
-            let _ = cdp(page_guard.execute(DOMEnable::default())).await;
-            let _ = Self::inject_anti_detection(&page_guard).await;
-        }
-
-        // Configure download behavior on first page
-        if !self.download_configured {
-            drop(browser_guard);
-            self.configure_download_dir().await?;
-        }
-
-        Ok(page_arc)
+        self.new_tab(None).await?;
+        self.page.clone().ok_or(BrowserError::NoPage)
     }
 
     async fn get_page(&self) -> Result<Arc<Mutex<Page>>, BrowserError> {
-        self.page.clone().ok_or(BrowserError::NoPage)
+        self.page.as_ref().ok_or(BrowserError::NoPage)?;
+        let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
+        self.existing_task_page(browser).await?.map(|page| Arc::new(Mutex::new(page)))
+            .ok_or_else(|| BrowserError::Execution(
+                "The selected task tab was closed. Use browser_navigate to create a replacement, or explicitly select a tab with browser_switch_tab. No other tab was used.".into()
+            ))
     }
 }
 
@@ -4840,19 +4850,431 @@ mod tests {
         cleanup_profile("adopt");
     }
 
+    /** Verifies ordinary navigation reuses Chrome's startup tab. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_navigation_reuses_startup_page() {
+        use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+        let mut client = isolated_client("quiet_startup");
+        client.launch(true).await.expect("launch");
+        let browser = client.browser.as_ref().unwrap().clone();
+        let before = cdp(browser.lock().await.execute(GetTargetsParams::default()))
+            .await
+            .expect("targets")
+            .result
+            .target_infos
+            .into_iter()
+            .filter(|t| t.r#type == "page")
+            .collect::<Vec<_>>();
+        assert!(!before.is_empty(), "Chrome has a startup tab");
+        let original_id = before[0].target_id.clone();
+        client
+            .navigate(&fixture_url("quiet_startup", STATIC_PAGE))
+            .await
+            .expect("navigate");
+        let after = cdp(browser.lock().await.execute(GetTargetsParams::default()))
+            .await
+            .expect("targets")
+            .result
+            .target_infos
+            .into_iter()
+            .filter(|t| t.r#type == "page")
+            .collect::<Vec<_>>();
+        let selected_id = client
+            .get_page()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .target_id()
+            .clone();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_startup");
+        assert_eq!(after.len(), before.len(), "navigation must not add a tab");
+        assert_eq!(selected_id, original_id, "reuse the startup tab");
+    }
+
+    /** Selecting the automation target must leave the user's visible tab alone. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_switch_does_not_activate() {
+        let mut client = isolated_client("quiet_switch");
+        client.launch(true).await.expect("launch");
+        client
+            .navigate(&fixture_url("quiet_target", STATIC_PAGE))
+            .await
+            .expect("navigate");
+        let target = client.get_page().await.unwrap().lock().await.clone();
+        client
+            .new_tab(Some(&fixture_url("quiet_user", STATIC_PAGE)))
+            .await
+            .expect("user tab");
+        let user_page = client.get_page().await.unwrap().lock().await.clone();
+        cdp(user_page.bring_to_front())
+            .await
+            .expect("simulate user selecting another tab");
+        let browser = client.browser.as_ref().unwrap().clone();
+        let pages = cdp(browser.lock().await.pages()).await.expect("pages");
+        let index = pages
+            .iter()
+            .position(|p| p.target_id() == target.target_id())
+            .unwrap();
+        client
+            .switch_tab(index)
+            .await
+            .expect("select automation target");
+        let visibility: String = cdp(user_page.evaluate("document.visibilityState"))
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        let selected_id = client
+            .get_page()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .target_id()
+            .clone();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_switch");
+        assert_eq!(selected_id, *target.target_id());
+        assert_eq!(
+            visibility, "visible",
+            "switching automation targets must not activate them"
+        );
+    }
+
+    /** Explicit new tabs stay in the background and become the next operation's target. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_new_tab_stays_in_background() {
+        let mut client = isolated_client("quiet_new");
+        client.launch(true).await.expect("launch");
+        client
+            .navigate(&fixture_url("quiet_user_new", STATIC_PAGE))
+            .await
+            .expect("navigate");
+        let user_page = client.get_page().await.unwrap().lock().await.clone();
+        cdp(user_page.bring_to_front())
+            .await
+            .expect("user tab visible");
+        let before = client.list_tabs().await.unwrap().len();
+        client.new_tab(None).await.expect("new background tab");
+        let new_id = client
+            .get_page()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .target_id()
+            .clone();
+        client
+            .navigate(&fixture_url("quiet_new_target", STATIC_PAGE))
+            .await
+            .expect("reuse new tab");
+        let after = client.list_tabs().await.unwrap().len();
+        let selected_id = client
+            .get_page()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .target_id()
+            .clone();
+        let visibility: String = cdp(user_page.evaluate("document.visibilityState"))
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_new");
+        assert_eq!(after, before + 1);
+        assert_eq!(new_id, selected_id);
+        assert_eq!(
+            visibility, "visible",
+            "new tab must not steal the visible selection"
+        );
+    }
+
+    /** Recovery must retain the selected target and its unsaved document state. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_reconnect_preserves_selected_page() {
+        let mut client = isolated_client("quiet_reconnect");
+        client.launch(true).await.expect("launch");
+        client
+            .navigate(&fixture_url("quiet_reconnect", STATIC_PAGE))
+            .await
+            .expect("navigate");
+        client
+            .new_tab(Some(&fixture_url("quiet_reconnect_selected", STATIC_PAGE)))
+            .await
+            .expect("selected tab");
+        client
+            .evaluate("window.unsaved = 'keep-me'")
+            .await
+            .expect("unsaved state");
+        let before = client.list_tabs().await.unwrap().len();
+        let selected_id = client
+            .get_page()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .target_id()
+            .clone();
+        client.browser = None;
+        let recovered = client.reconnect().await;
+        let after = client.list_tabs().await.unwrap().len();
+        let new_id = client
+            .get_page()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .target_id()
+            .clone();
+        let unsaved = client.evaluate("window.unsaved || 'lost'").await.unwrap();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_reconnect");
+        recovered.expect("reconnect");
+        assert_eq!(
+            selected_id, new_id,
+            "reconnect must reuse the selected target"
+        );
+        assert_eq!(before, after, "reconnect must not add tabs");
+        assert_eq!(
+            unsaved.as_str(),
+            Some("keep-me"),
+            "reconnect must not reload the page"
+        );
+    }
+
+    /** A closed task page may be replaced once, without navigating another user's tab. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_closed_target_gets_one_replacement() {
+        let mut client = isolated_client("quiet_closed");
+        client.launch(true).await.expect("launch");
+        let user_url = fixture_url("quiet_closed_user", STATIC_PAGE);
+        client.navigate(&user_url).await.expect("user page");
+        let user_page = client.get_page().await.unwrap().lock().await.clone();
+        client.new_tab(None).await.expect("task page");
+        let task_page = client.get_page().await.unwrap().lock().await.clone();
+        cdp(task_page.close()).await.expect("user closes task page");
+        let result = client
+            .navigate(&fixture_url("quiet_closed_replacement", STATIC_PAGE))
+            .await;
+        if result.is_ok() {
+            client
+                .navigate(&fixture_url("quiet_closed_again", STATIC_PAGE))
+                .await
+                .expect("reuse replacement");
+        }
+        let after = client.list_tabs().await.unwrap().len();
+        let untouched_url: String = cdp(user_page.evaluate("location.href"))
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_closed");
+        result.expect("navigate should replace a confirmed closed target");
+        assert_eq!(after, 2, "exactly the user tab and one replacement remain");
+        assert_eq!(
+            untouched_url, user_url,
+            "never navigate the unrelated user tab"
+        );
+    }
+
+    /** Foreground activation remains available when explicitly requested. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_explicit_activation_and_background_actions() {
+        let mut client = isolated_client("quiet_activate");
+        client.launch(true).await.expect("launch");
+        client.navigate(&fixture_url("quiet_actions", r#"<!doctype html><input id="text"><button id="button" onclick="this.textContent='done'">click</button>"#)).await.expect("navigate");
+        let task = client.get_page().await.unwrap().lock().await.clone();
+        client
+            .new_tab_with_options(None, true)
+            .await
+            .expect("explicit foreground tab");
+        let foreground = client.get_page().await.unwrap().lock().await.clone();
+        let visible: String = cdp(foreground.evaluate("document.visibilityState"))
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        assert_eq!(visible, "visible");
+        let tabs = client.list_tabs().await.unwrap();
+        let index = tabs
+            .iter()
+            .find(|tab| tab["target_id"] == serde_json::json!(task.target_id()))
+            .unwrap()["index"]
+            .as_u64()
+            .unwrap() as usize;
+        client
+            .switch_tab(index)
+            .await
+            .expect("select background task");
+        client
+            .type_text("#text", "中文后台输入")
+            .await
+            .expect("background typing");
+        client.click("#button").await.expect("background click");
+        let value = client
+            .evaluate("document.querySelector('#text').value")
+            .await
+            .unwrap();
+        let clicked = client
+            .evaluate("document.querySelector('#button').textContent")
+            .await
+            .unwrap();
+        let still_visible: String = cdp(foreground.evaluate("document.visibilityState"))
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        client
+            .switch_tab_with_options(index, true)
+            .await
+            .expect("explicit activation");
+        let active: String = cdp(task.evaluate("document.visibilityState"))
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_activate");
+        assert_eq!(value, "中文后台输入");
+        assert_eq!(clicked, "done");
+        assert_eq!(
+            still_visible, "visible",
+            "background input must not activate the task"
+        );
+        assert_eq!(active, "visible", "explicit activation must still work");
+    }
+
+    /** An external CDP reconnect must restore the chosen target without closing its owner. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_external_reattach_preserves_selection() {
+        let mut owner = isolated_client("quiet_external_owner");
+        owner.launch(true).await.expect("launch owner");
+        owner
+            .navigate(&fixture_url("quiet_external_user", STATIC_PAGE))
+            .await
+            .expect("user page");
+        let port_file =
+            std::fs::read_to_string(owner.profile_dir.join("DevToolsActivePort")).unwrap();
+        let port = port_file.lines().next().unwrap();
+        let mut client = isolated_client("quiet_external_client");
+        client.external_cdp_url = Some(format!("http://127.0.0.1:{port}"));
+        client.launch(true).await.expect("external attach");
+        client
+            .new_tab(Some(&fixture_url("quiet_external_target", STATIC_PAGE)))
+            .await
+            .expect("task tab");
+        client
+            .evaluate("window.unsaved = 'external-state'")
+            .await
+            .unwrap();
+        let id = client.selected_target_id.clone();
+        let before = client.list_tabs().await.unwrap().len();
+        client.browser = None;
+        client.launch(true).await.expect("external reattach");
+        let after = client.list_tabs().await.unwrap().len();
+        let restored = client.selected_target_id.clone();
+        let state = client.evaluate("window.unsaved").await.unwrap();
+        client.close().await.expect("disconnect external client");
+        let owner_alive = owner.is_connection_alive().await;
+        owner.close().await.expect("close owner");
+        cleanup_profile("quiet_external_owner");
+        cleanup_profile("quiet_external_client");
+        assert_eq!(id, restored);
+        assert_eq!(before, after);
+        assert_eq!(state, "external-state");
+        assert!(
+            owner_alive,
+            "external disconnect must not close the owner's browser"
+        );
+    }
+
+    /** Existing website popups can be selected and reused without creating duplicates. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_site_popup_is_reused() {
+        let mut client = isolated_client("quiet_popup");
+        client.launch(true).await.expect("launch");
+        client
+            .navigate(&fixture_url("quiet_popup_parent", STATIC_PAGE))
+            .await
+            .expect("parent page");
+        let popup_url = fixture_url("quiet_popup_child", STATIC_PAGE);
+        client
+            .evaluate(&format!(
+                "window.open({}); true",
+                serde_json::to_string(&popup_url).unwrap()
+            ))
+            .await
+            .expect("site popup");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let tabs = loop {
+            let tabs = client.list_tabs().await.unwrap();
+            if tabs.iter().any(|tab| tab["url"] == popup_url) {
+                break tabs;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "popup must appear");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let popup = tabs.iter().find(|tab| tab["url"] == popup_url).unwrap();
+        let id = popup["target_id"].clone();
+        client
+            .switch_tab(popup["index"].as_u64().unwrap() as usize)
+            .await
+            .expect("select popup");
+        client
+            .navigate(&fixture_url("quiet_popup_next", STATIC_PAGE))
+            .await
+            .expect("continue in popup");
+        let after = client.list_tabs().await.unwrap();
+        let selected =
+            after.iter().find(|tab| tab["selected"] == true).unwrap()["target_id"].clone();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_popup");
+        assert_eq!(tabs.len(), after.len());
+        assert_eq!(id, selected);
+    }
+
     /// Test client with an isolated profile: avoids sharing the running Nuphus App's
     /// browser_profile_v2 (try_attach would connect to the App instance and hang navigate).
     /// Each test uses its own directory to avoid SingletonLock conflicts.
     fn isolated_client(name: &str) -> BrowserClient {
         let mut client = BrowserClient::new().expect("chrome required");
-        client.profile_dir = std::env::temp_dir().join(format!("nuphus_autowait_profile_{}", name));
+        client.profile_dir = test_profile_dir(name);
+        client.download_dir = client.profile_dir.join("downloads");
+        client.external_cdp_url = None;
+        client.external_identity = None;
         client
     }
 
     /// Best-effort cleanup of the isolated profile directory after close (Chrome handle release may lag).
     fn cleanup_profile(name: &str) {
-        let dir = std::env::temp_dir().join(format!("nuphus_autowait_profile_{}", name));
+        let dir = test_profile_dir(name);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /** Isolates successive test processes while allowing intentional same-test reattachment. */
+    fn test_profile_dir(name: &str) -> PathBuf {
+        static RUN_ID: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let run_id = RUN_ID.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        });
+        std::env::temp_dir().join(format!("nuphus_autowait_profile_{run_id}_{name}"))
     }
 
     /// Write a temp HTML fixture and return its file:// URL.

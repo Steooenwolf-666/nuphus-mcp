@@ -394,7 +394,7 @@ fn browser_tools() -> Vec<ToolDef> {
     vec![
         tool_def(
             "browser_navigate",
-            "Open URL in browser",
+            "Navigate the selected task tab to a URL, reusing it without foreground activation. Do not use browser_new_tab for ordinary navigation.",
             json_props! {
                 "url" => obj!("type"="string","description"="URL to navigate to")
             },
@@ -561,23 +561,25 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_new_tab",
-            "Open new browser tab",
+            "Explicitly open and select a new task tab in the background. Use only when a separate tab is needed; ordinary navigation should use browser_navigate. For an existing site popup, use browser_list_tabs then browser_switch_tab instead of opening a duplicate.",
             json_props! {
-                "url" => obj!("type"="string","description"="URL to open in new tab")
+                "url" => obj!("type"="string","description"="URL to open in new tab"),
+                "activate" => obj!("type"="boolean","default"=false,"description"="Bring the new tab to the foreground only when explicitly needed")
             },
             &[],
         ),
         tool_def(
             "browser_list_tabs",
-            "List all open tabs with indices, URLs, and titles.",
+            "List open tabs with indices, URLs, titles, stable target IDs, and selected (the task target, not UI focus). List again before switching because indices may change.",
             json!({}),
             &[],
         ),
         tool_def(
             "browser_switch_tab",
-            "Switch focus to tab by index.",
+            "Select the task tab by index without changing foreground focus. Subsequent browser tools reuse this tab. Set activate=true only when foreground interaction is necessary.",
             json_props! {
-                "index" => obj!("type"="integer","description"="Tab index from list_tabs")
+                "index" => obj!("type"="integer","description"="Tab index from list_tabs"),
+                "activate" => obj!("type"="boolean","default"=false,"description"="Bring the selected tab to the foreground only when explicitly needed")
             },
             &["index"],
         ),

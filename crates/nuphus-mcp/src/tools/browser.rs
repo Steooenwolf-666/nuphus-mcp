@@ -221,14 +221,6 @@ async fn run_op_with_reconnect(
     match tokio::time::timeout(timeout, run_op(client, name, args)).await {
         Ok(Ok(out)) => Ok(out),
         Ok(Err(e)) if BrowserClient::is_connection_error(&e) => {
-            // A connection-class error is either genuine transport death (handler task
-            // gone / websocket dropped) or a per-call CDP timeout on a slow or
-            // mid-navigation page (the cdp() budget, e.g. `navigate` timing out then a
-            // snapshot on the half-dead page). Distinguish before tearing the browser
-            // down — reconnect() relaunches Chrome and destroys every tab, so it must
-            // only run when the connection probe AND the child process both confirm
-            // death. A responsive link or a live process means the page is busy: return
-            // the error fast instead of killing a healthy browser for nothing.
             if client.is_connection_alive().await {
                 return Err(format!(
                     "Browser '{name}' failed with a connection error but the CDP connection is \
@@ -236,16 +228,8 @@ async fn run_op_with_reconnect(
                      later"
                 ));
             }
-            if client.child_process_alive() == Some(true) {
-                return Err(format!(
-                    "Browser '{name}' failed with a connection error and the CDP connection is \
-                     unresponsive, but the Chrome process is still alive ({e}); refusing to kill \
-                     a live browser — retry later."
-                ));
-            }
             tracing::warn!(
-                "[browser] CDP connection failed and the Chrome process is gone ({}), reconnecting",
-                e
+                "[browser] CDP connection failed ({e}); reattaching to the task browser"
             );
             client
                 .reconnect()
@@ -256,7 +240,7 @@ async fn run_op_with_reconnect(
                 // browser is healthy again, but re-issuing could double-execute.
                 return Err(format!(
                     "Browser '{name}' failed with a dead CDP connection ({e}); the browser was \
-                     restarted, but the operation may have already executed before the connection \
+                     reconnected, but the operation may have already executed before the connection \
                      dropped — verify the page state, then retry manually (writes are not auto-retried)."
                 ));
             }
@@ -272,27 +256,14 @@ async fn run_op_with_reconnect(
             if client.is_connection_alive().await {
                 return Err(format!("Browser '{name}' timed out after {timeout_secs}s"));
             }
-            // Probe failed — but a probe timeout is NOT proof of death (CDP event
-            // floods on heavy pages can delay the probe; see launch()'s contract).
-            // Killing on a false positive destroys every tab, so demand a second
-            // signal: the Chromium child process must actually be gone.
-            if client.child_process_alive() == Some(true) {
-                return Err(format!(
-                    "Browser '{name}' timed out after {timeout_secs}s and the CDP connection is \
-                     unresponsive, but the Chrome process is still alive (page likely busy); \
-                     refusing to kill a live browser — retry later."
-                ));
-            }
-            tracing::warn!(
-                "[browser] operation timed out after {timeout_secs}s, connection probe failed and the Chrome process is gone; reconnecting"
-            );
+            tracing::warn!("[browser] operation timed out after {timeout_secs}s and probe failed; reattaching without killing a live browser");
             client
                 .reconnect()
                 .await
                 .map_err(|e| format!("browser reconnect failed: {e}"))?;
             if !is_read_only_tool(name) {
                 return Err(format!(
-                    "Browser '{name}' timed out after {timeout_secs}s; the browser was restarted, \
+                    "Browser '{name}' timed out after {timeout_secs}s; the browser was reconnected, \
                      but the operation may have already executed — verify the page state, then \
                      retry manually (writes are not auto-retried)."
                 ));
@@ -559,7 +530,11 @@ async fn run_op(
                 }
                 None => None,
             };
-            client.new_tab(url).await?
+            let activate = args
+                .get("activate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            client.new_tab_with_options(url, activate).await?
         }
         "browser_list_tabs" => {
             let tabs = client.list_tabs().await?;
@@ -567,7 +542,11 @@ async fn run_op(
         }
         "browser_switch_tab" => {
             let index = args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            client.switch_tab(index).await?
+            let activate = args
+                .get("activate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            client.switch_tab_with_options(index, activate).await?
         }
         _ => {
             return Err(BrowserError::Execution(format!(
