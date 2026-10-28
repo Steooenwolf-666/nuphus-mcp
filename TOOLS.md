@@ -743,14 +743,13 @@ re-sends the original action, launches an application or steals focus.
 
 ## Browser Tools (23)
 
-Browser tools operate a Chrome instance over CDP (`chromiumoxide`). The first
-browser call launches a visible Chrome window; `browser_close` closes it and
+Browser tools operate a Chrome instance over CDP (`chromiumoxide`). They reuse an existing configured browser when available; otherwise the first call launches a visible Chrome window; `browser_close` closes it and
 releases resources. A 15-second timeout guards CDP operations (`navigate` /
 `back` / `forward` get 30s; `wait_for` gets its timeout + 5s).
 
 ### browser_navigate
 
-Open URL in browser.
+Navigate the selected task tab to a URL without activating it. Reuse the same tab for ordinary navigation. A confirmed closed task tab gets one background replacement; other user tabs are not repurposed. A disconnected session first reconnects to the same target without reloading it.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -1121,11 +1120,12 @@ List files in the browser download directory.
 
 ### browser_new_tab
 
-Open a new browser tab.
+Explicitly open a new task tab in the background and select it for subsequent operations. Use `browser_navigate` for ordinary navigation. If a site already opened a popup or tab, list and switch to it instead of creating a duplicate.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
 | `url` | string | no | - | URL to open in the new tab |
+| `activate` | boolean | no | `false` | Bring the new tab to the foreground only when explicitly needed |
 
 **Example**
 ```json
@@ -1136,8 +1136,7 @@ Open a new browser tab.
 
 ### browser_list_tabs
 
-List all open tabs with indices, URLs, and titles. Indices reflect the current
-tab ordering and may change when tabs are opened or closed.
+List open tabs with indices, URLs, titles, `target_id`, and `selected`. `selected` identifies the task target, independently of the user-visible tab. Indices may change when tabs open or close; list again before switching.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -1152,11 +1151,12 @@ tab ordering and may change when tabs are opened or closed.
 
 ### browser_switch_tab
 
-Switch to a tab by index and bring it to the front in the visible Chrome window.
+Select the task tab by index without changing foreground focus. Subsequent browser operations use this target even if the user switches to another tab or application. Use `activate: true` only for an explicitly requested foreground action or an interaction that requires visibility.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
 | `index` | integer | **yes** | - | Tab index from `browser_list_tabs` |
+| `activate` | boolean | no | `false` | Bring the selected tab to the foreground |
 
 **Example**
 ```json
