@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rustls-webpki` upgraded to 0.103.16** — resolves RUSTSEC-2026-0382 (certificate paths accepting distrusted intermediates) and restores the dependency-audit CI check. Only the lockfile version and checksum change; the audit policy is unchanged.
+
 - **Browser tasks reuse existing tabs and avoid foreground activation by default.** Navigation adopts the startup page, reconnects preserve the selected target and unsaved state, and a confirmed closed target gets one background replacement without taking over unrelated tabs. `browser_new_tab` and `browser_switch_tab` accept optional `activate: true`; omitted or false keeps the operation in the background. Tab listings expose `target_id` and `selected`. An interrupted tab-creation request requires listing/selecting a target before another create attempt.
 
 - **`rustls` upgraded to 0.23.46** — clears four advisories (RUSTSEC-2026-0346 … -0349: TLS secrets exposed by `Debug` impls of client session values, buffered application data sent to the outer server after ECH rejection, classical key-exchange downgrade via unauthenticated ServerHello, and a pre-authentication 1 GiB Brotli certificate-decompression allocation). Lock-only bump — `rustls` is a transitive dep via `reqwest → hyper-rustls → tokio-rustls`; `cargo audit` is unblocked again.
