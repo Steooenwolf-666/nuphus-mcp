@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Browser recovery preserves process ownership across cancellation and reuses fresh startup tabs.** Cancelling a stalled reconnect no longer drops the live Chrome process handle. After a confirmed browser crash and fresh launch, obsolete target bindings are cleared so recovery adopts the startup page without opening an extra tab. Two real-Chrome regression tests cover cancellation/retry and crash recovery/navigation.
+
 - **`rustls-webpki` upgraded to 0.103.16** — resolves RUSTSEC-2026-0382 (certificate paths accepting distrusted intermediates) and restores the dependency-audit CI check. Only the lockfile version and checksum change; the audit policy is unchanged.
 
 - **Browser tasks reuse existing tabs and avoid foreground activation by default.** Navigation adopts the startup page, reconnects preserve the selected target and unsaved state, and a confirmed closed target gets one background replacement without taking over unrelated tabs. `browser_new_tab` and `browser_switch_tab` accept optional `activate: true`; omitted or false keeps the operation in the background. Tab listings expose `target_id` and `selected`. An interrupted tab-creation request requires listing/selecting a target before another create attempt.

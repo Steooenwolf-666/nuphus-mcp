@@ -1439,6 +1439,9 @@ impl BrowserClient {
         let browser_arc = Arc::new(Mutex::new(browser));
         self.browser = Some(browser_arc.clone());
         self.launched_headless = Some(headless);
+        self.page = None;
+        self.selected_target_id = None;
+        self.page_creation_pending = false;
         self.adopt_existing_page(&browser_arc).await?;
         Ok(())
     }
@@ -1511,8 +1514,9 @@ impl BrowserClient {
         let browser_arc = Arc::new(Mutex::new(browser));
         self.browser = Some(browser_arc.clone());
         self.page = None;
-        self.child_process = None; // attached instance does not belong to this process; close must not kill it
-        self.launched_headless = None; // mode unknown; do not trigger a headless→headed upgrade restart
+        if self.child_process.is_none() {
+            self.launched_headless = None;
+        }
 
         // A2: actively pull existing targets after attaching. chromiumoxide only tracks
         // pages created after the connection is established; without fetch_targets,
@@ -3771,6 +3775,7 @@ impl BrowserClient {
     /**
      * Reconnects to the same browser and task target before considering a launch.
      * A live managed process is never killed because its CDP connection failed.
+     * Keep its kill-on-drop handle in self across awaits so cancellation cannot kill it.
      * Closed targets receive at most one background replacement; writes are not replayed.
      */
     pub async fn reconnect(&mut self) -> Result<(), BrowserError> {
@@ -3785,12 +3790,7 @@ impl BrowserClient {
         if self.external_cdp_url.is_none()
             && (self.child_process_alive() == Some(true) || self.attach_target_alive().await)
         {
-            let child = self.child_process.take();
-            let mode = self.launched_headless;
-            let result = self.try_attach().await;
-            self.child_process = child;
-            self.launched_headless = mode;
-            result?;
+            self.try_attach().await?;
         } else {
             if let Some(mut child) = self.child_process.take() {
                 let _ = tokio::time::timeout(
@@ -5245,6 +5245,110 @@ mod tests {
         cleanup_profile("quiet_popup");
         assert_eq!(tabs.len(), after.len());
         assert_eq!(id, selected);
+    }
+
+    /**
+     * Cancelling a stalled CDP attach must leave the owned browser and task intact.
+     * Accept TCP without completing the WebSocket handshake, then drop the reconnect future.
+     */
+    #[tokio::test]
+    #[ignore = "requires Chrome"]
+    async fn quiet_tabs_recovery_cancelled_reconnect_preserves_browser() {
+        let mut client = isolated_client("quiet_cancelled_reconnect");
+        client.launch(true).await.expect("launch");
+        client
+            .navigate(&fixture_url("quiet_cancelled_reconnect", STATIC_PAGE))
+            .await
+            .expect("navigate");
+        let before = client.list_tabs().await.unwrap();
+        let original_browser = client.browser.as_ref().unwrap().clone();
+        let port_path = client.profile_dir.join("DevToolsActivePort");
+        let original_port_file = std::fs::read_to_string(&port_path).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            &port_path,
+            format!("{port}\n/devtools/browser/stalled-reconnect\n"),
+        )
+        .unwrap();
+
+        let reached_attach = tokio::select! {
+            _ = client.reconnect() => false,
+            accepted = tokio::time::timeout(
+                std::time::Duration::from_secs(5), listener.accept()
+            ) => matches!(accepted, Ok(Ok(_))),
+        };
+        let child_retained = client.child_process.is_some();
+        let mode_retained = client.launched_headless == Some(true);
+        let alive = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            original_browser.lock().await.version().await
+        })
+        .await;
+        let browser_alive = matches!(alive, Ok(Ok(_)));
+        std::fs::write(&port_path, original_port_file).unwrap();
+
+        let recovered_tabs = if browser_alive && child_retained {
+            client.reconnect().await.expect("retry reconnect");
+            Some(client.list_tabs().await.unwrap())
+        } else {
+            None
+        };
+        let still_owned = client.child_process.is_some();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_cancelled_reconnect");
+
+        assert!(
+            reached_attach,
+            "reconnect did not reach the stalled endpoint"
+        );
+        assert!(
+            child_retained,
+            "cancellation dropped the owned Chrome process"
+        );
+        assert!(mode_retained, "cancellation lost the browser launch mode");
+        assert!(browser_alive, "cancellation killed the running browser");
+        assert!(
+            still_owned,
+            "successful reattachment lost process ownership"
+        );
+        let after = recovered_tabs.unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0]["target_id"], before[0]["target_id"]);
+        assert_eq!(after[0]["url"], before[0]["url"]);
+        assert_eq!(after[0]["selected"], true);
+    }
+
+    /** A fresh browser after a crash must adopt its startup page instead of adding a second tab. */
+    #[tokio::test]
+    #[ignore = "requires Chrome"]
+    async fn quiet_tabs_recovery_after_crash_reuses_startup_page() {
+        let mut client = isolated_client("quiet_crash_recovery");
+        client.launch(true).await.expect("launch");
+        client
+            .navigate(&fixture_url("quiet_crash_before", STATIC_PAGE))
+            .await
+            .expect("navigate");
+        let before = client.list_tabs().await.unwrap();
+        let mut child = client.child_process.take().unwrap();
+        child.kill().await.expect("kill browser");
+        child.wait().await.expect("wait for browser exit");
+
+        client.reconnect().await.expect("recover after crash");
+        let recovered = client.list_tabs().await.unwrap();
+        client
+            .navigate(&fixture_url("quiet_crash_after", STATIC_PAGE))
+            .await
+            .expect("navigate after recovery");
+        let after = client.list_tabs().await.unwrap();
+        client.close().await.expect("close");
+        cleanup_profile("quiet_crash_recovery");
+
+        assert_eq!(before.len(), 1);
+        assert_eq!(recovered.len(), 1, "recovery opened an extra tab");
+        assert_eq!(recovered[0]["selected"], true);
+        assert_ne!(recovered[0]["target_id"], before[0]["target_id"]);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["target_id"], recovered[0]["target_id"]);
     }
 
     /// Test client with an isolated profile: avoids sharing the running Nuphus App's
