@@ -1,6 +1,7 @@
 //! MCP tool registry: schema exposure + name dispatch execution.
 
 pub mod browser;
+mod browser_sequence;
 pub mod desktop;
 mod schemas;
 pub mod semantic;
@@ -39,16 +40,16 @@ impl ToolOutput {
 
 /// Execute a tool by name. Unknown tool names return Err (→ JSON-RPC -32602).
 ///
-/// Automation safety: desktop and browser automation operate on exclusive machine
-/// resources (mouse/keyboard/screen/browser). Only one Agent may run an automation
-/// operation at any moment:
-/// - **Process-level**: a process-wide tokio Mutex serializes all automation calls
-///   within this server instance (a stdio loop is sequential anyway; this also makes
-///   parallel test execution deterministic).
-/// - **Cross-process**: a file lock coordinates multiple MCP server instances (one
-///   per Agent via stdio) through `{data_dir}/Nuphus/nuphus-mcp/automation.lock`.
-/// The lock is held only for the duration of this call (short hold), released on return.
+/// Different MCP processes may operate separate task tabs concurrently. Desktop
+/// and explicit foreground operations acquire the machine gate exclusively.
+/// Within one session, preserve sequential command/ref/target state.
 pub async fn execute(name: &str, args: &serde_json::Value) -> Result<ToolOutput, String> {
+    let known = has_tool(name);
+    #[cfg(test)]
+    let known = known || name == "test_panic_tool";
+    if !known {
+        return Err(format!("Unknown tool: {name}"));
+    }
     // Process-level mutual exclusion: serialize automation operations within this
     // process. Held across the await points of the actual tool call.
     // Bounded: this lock sits *outside* every per-tool budget, so an unbounded
@@ -72,11 +73,10 @@ pub async fn execute(name: &str, args: &serde_json::Value) -> Result<ToolOutput,
         }
     };
 
-    // Cross-process lock: full coverage for every desktop_*/browser_* tool.
-    // Read-only operations (e.g. desktop_screen_size) also acquire it — they still
-    // touch the shared machine state and must not interleave with a writer's sequence.
+    // Shared machine access for background browser operations, exclusive access
+    // for desktop / foreground operations. Tab ownership lives in BrowserClient.
     let lock = crate::automation_lock::AutomationLock::new();
-    let file_guard = match lock.acquire(name) {
+    let file_guard = match lock.acquire(name, args) {
         Ok(guard) => guard,
         Err(e) => return Ok(ToolOutput::failure(e)),
     };
@@ -100,8 +100,28 @@ pub async fn execute(name: &str, args: &serde_json::Value) -> Result<ToolOutput,
     drop(file_guard);
     drop(process_guard);
     match result {
-        Ok(text) => Ok(ToolOutput::success(text)),
+        Ok(text) => Ok(output_from_text(name, text)),
         Err(e) => Ok(ToolOutput::failure(e)),
+    }
+}
+
+fn output_from_text(name: &str, text: String) -> ToolOutput {
+    // Only the batch executor owns this envelope. A user's evaluate result may
+    // legitimately contain success:false and is not a tool-level error.
+    let batch_failed = name == "browser_exec"
+        && serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|value| {
+            let failed = |row: &serde_json::Value| {
+                row.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+                    || row.get("success").and_then(serde_json::Value::as_str) == Some("unknown")
+            };
+            value
+                .as_array()
+                .map_or_else(|| failed(&value), |rows| rows.iter().any(failed))
+        });
+    if batch_failed {
+        ToolOutput::failure(text)
+    } else {
+        ToolOutput::success(text)
     }
 }
 
@@ -114,6 +134,30 @@ pub fn has_tool(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn batch_failures_propagate_to_mcp_without_reinterpreting_page_data() {
+        assert!(
+            output_from_text(
+                "browser_exec",
+                r#"{"success":false,"status":"unknown","steps":[]}"#.into()
+            )
+            .is_error
+        );
+        assert!(!output_from_text("browser_exec", r#"{"success":true}"#.into()).is_error);
+        assert!(!output_from_text("browser_evaluate", r#"{"success":false}"#.into()).is_error);
+        assert!(!output_from_text("browser_exec", "legacy text".into()).is_error);
+        for text in [
+            r#"[{"op":"batch_error","success":false}]"#,
+            r#"[{"op":"batch_truncated","success":"unknown"}]"#,
+            r#"[{"op":"click","success":true},{"op":"fill","success":false}]"#,
+        ] {
+            assert!(output_from_text("browser_exec", text.into()).is_error);
+        }
+        assert!(
+            !output_from_text("browser_exec", r#"[{"op":"click","success":true}]"#.into()).is_error
+        );
+    }
 
     /// Every desktop_* tool registered in schemas must have a dispatch branch in
     /// `tools/desktop.rs` — the desktop counterpart of browser.rs's

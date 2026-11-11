@@ -2072,6 +2072,7 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "thiserror 2.0.19",
  "tokio",
@@ -2081,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "nuphus-mcp"
-version = "0.3.4"
+version = "0.3.5-own.1"
 dependencies = [
  "async-trait",
  "base64",

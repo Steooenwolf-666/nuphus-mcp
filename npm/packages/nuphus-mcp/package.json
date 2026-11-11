@@ -1,6 +1,6 @@
 {
   "name": "@nuphus/nuphus-mcp",
-  "version": "0.3.4",
+  "version": "0.3.5-own.1",
   "description": "Nuphus MCP server — AI computer operation (desktop + browser tools). Platform binary auto-selected via optionalDependencies.",
   "license": "MIT",
   "repository": {
@@ -8,7 +8,13 @@
     "url": "git+https://github.com/mrpulor-gh/nuphus-mcp.git"
   },
   "homepage": "https://github.com/mrpulor-gh/nuphus-mcp",
-  "keywords": ["mcp", "model-context-protocol", "desktop-automation", "browser-automation", "nuphus"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "desktop-automation",
+    "browser-automation",
+    "nuphus"
+  ],
   "engines": {
     "node": ">=16"
   },
@@ -23,10 +29,10 @@
     "prepublishOnly": "node ./scripts/check-clean-bin.js"
   },
   "optionalDependencies": {
-    "@nuphus/nuphus-mcp-win32-x64": "0.3.4",
-    "@nuphus/nuphus-mcp-win32-arm64": "0.3.4",
-    "@nuphus/nuphus-mcp-linux-x64": "0.3.4",
-    "@nuphus/nuphus-mcp-linux-arm64": "0.3.4",
-    "@nuphus/nuphus-mcp-osx-arm64": "0.3.4"
+    "@nuphus/nuphus-mcp-win32-x64": "0.3.5-own.1",
+    "@nuphus/nuphus-mcp-win32-arm64": "0.3.5-own.1",
+    "@nuphus/nuphus-mcp-linux-x64": "0.3.5-own.1",
+    "@nuphus/nuphus-mcp-linux-arm64": "0.3.5-own.1",
+    "@nuphus/nuphus-mcp-osx-arm64": "0.3.5-own.1"
   }
 }

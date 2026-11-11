@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.4] - 2026-11-08
-
 ### Fixed
 
 - **Browser recovery preserves process ownership across cancellation and reuses fresh startup tabs.** Cancelling a stalled reconnect no longer drops the live Chrome process handle. After a confirmed browser crash and fresh launch, obsolete target bindings are cleared so recovery adopts the startup page without opening an extra tab. Two real-Chrome regression tests cover cancellation/retry and crash recovery/navigation.
@@ -18,8 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Browser tasks reuse existing tabs and avoid foreground activation by default.** Navigation adopts the startup page, reconnects preserve the selected target and unsaved state, and a confirmed closed target gets one background replacement without taking over unrelated tabs. `browser_new_tab` and `browser_switch_tab` accept optional `activate: true`; omitted or false keeps the operation in the background. Tab listings expose `target_id` and `selected`. An interrupted tab-creation request requires listing/selecting a target before another create attempt.
 
 - **`rustls` upgraded to 0.23.46** — clears four advisories (RUSTSEC-2026-0346 … -0349: TLS secrets exposed by `Debug` impls of client session values, buffered application data sent to the outer server after ECH rejection, classical key-exchange downgrade via unauthenticated ServerHello, and a pre-authentication 1 GiB Brotli certificate-decompression allocation). Lock-only bump — `rustls` is a transitive dep via `reqwest → hyper-rustls → tokio-rustls`; `cargo audit` is unblocked again.
-
-- **`browser_screenshot` captures the selected task tab without activating it.** Screenshots no longer pull a window to the foreground; a background capture that stops producing frames returns a bounded 5-second timeout with an actionable message — no automatic activation, retry or reconnect — so agents fall back to `browser_snapshot` / `browser_extract` and activate only when the user explicitly asks for foreground interaction. Tool description and both `TOOLS` docs updated; no schema field changed.
 
 ## [0.3.3] - 2026-10-13
 
@@ -459,4 +455,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.3]: https://github.com/mrpulor-gh/nuphus-mcp/releases/tag/v0.1.3
 [0.1.2]: https://github.com/mrpulor-gh/nuphus-mcp/releases/tag/v0.1.2
 [0.1.1]: https://github.com/mrpulor-gh/nuphus-mcp/releases/tag/v0.1.1
-[0.1.0]: https://github.com/mrpulor-gh/nuphus-mcp/releases/tag/v0.1.0
+[0.1.0]: https://github.com/mrpulor-gh/nuphus-mcp/releases/tag/v0.1.0## [0.3.5-own.1] - 2026-11-11 (self-hosted build)
+
+Personal build on top of upstream 0.3.4. Not published; upstream review is in
+mrpulor-gh/nuphus-mcp#15–#19 (bugfix/feature stack) and #21 (coordination design).
+
+### Added
+- `browser_exec` accepts structured `steps` (1–12 ops, whole-plan validation,
+  no replay of an uncertain write, `isError` on a failed batch).
+- `read` op with bounded tail and optional receipt wait; `browser_type`
+  `clear`/`mode:insert|paste`; `browser_evaluate` accepts a `ref`.
+
+### Changed
+- Clicks and key presses return a dispatch receipt instead of failing when the
+  outer DOM does not change; `observe_change:true` restores the observation.
+- Session-scoped tab ownership (coordination protocol v2): OS file locks,
+  `tab:{browser}:{target}` claims, `browser_list_tabs` adds
+  `target_id/selected/available`, `browser_switch_tab` accepts `target_id`.
+- `browser_close` disconnects this session and releases its tab claim; shared
+  Chrome and its tabs stay open.
+
+### Fixed
+- Trusted clicks inside iframes use main-viewport coordinates (CDP content quads).
+- `browser_upload` verifies assigned file metadata and resolves `@N` through the
+  AX backend node; native file drag keeps `items:[]`; download listing surfaces
+  read errors instead of returning an empty list.
+- Unit tests no longer contend on the machine gate under default parallelism.
+
+

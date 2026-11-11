@@ -168,7 +168,10 @@ impl McpServer {
             },
             "instructions": "Nuphus MCP Server — AI computer operation capability (desktop + browser). \
                              desktop_* tools operate the local screen/windows/keyboard/mouse; browser_* tools \
-                             operate Chrome (CDP). Activate the target window with desktop_window_activate before window operations.",
+                             operate Chrome (CDP). Each session owns its selected tab until switching or browser_close. \
+                             Separate tabs can run concurrently; prefer stable target_id when switching. \
+                             browser_close disconnects only this session, leaving shared Chrome open. \
+                             Activate the target window with desktop_window_activate before window operations.",
         }))
     }
 
@@ -314,7 +317,9 @@ mod tests {
 
     fn error_of(resp: &str) -> (i32, String) {
         let v = parse(resp);
-        let err = v.get("error").expect("response must have error");
+        let err = v
+            .get("error")
+            .unwrap_or_else(|| panic!("response must have error: {resp}"));
         (
             err.get("code").and_then(Value::as_i64).unwrap_or(0) as i32,
             err.get("message")
@@ -525,7 +530,8 @@ mod tests {
         assert_eq!(content["type"], "text");
         let text = content["text"].as_str().expect("text must be string");
         // Text should be {"width":N,"height":M}
-        let parsed: Value = serde_json::from_str(text).expect("result must be JSON");
+        let parsed: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("result must be JSON: {e}; response={resp}"));
         assert!(parsed["width"].as_u64().unwrap_or(0) > 0);
         assert!(parsed["height"].as_u64().unwrap_or(0) > 0);
     }
